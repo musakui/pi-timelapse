@@ -1,5 +1,8 @@
 from time import sleep
 from io import BytesIO
+from json import dumps, loads
+from mimetypes import types_map
+from urllib.parse import urlparse
 from threading import Thread, Condition
 from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -155,10 +158,86 @@ class PiCamServer(ThreadingHTTPServer):
 
 class PiCamHandler(BaseHTTPRequestHandler):
 
-    def do_GET(self):
-        self.send_response(200)
+    static_path = 'static'
+    content_type = 'multipart/x-mixed-replace; boundary=FRAME'
+
+    def send_frame(self):
+        frame = self.server.frame
+        self.wfile.write(b'--FRAME\r\n')
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', len(frame))
         self.end_headers()
-        self.wfile.write(b'')
+        self.wfile.write(frame)
+        self.wfile.write(b'\r\n')
+
+    def send_stream(self):
+        self.send_response(200)
+        self.send_header('Age', 0)
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Content-Type', self.content_type)
+        self.send_header('Cache-Control', 'no-cache, private')
+        self.end_headers()
+
+        self.send_frame()
+        try:
+            while self.server.stream:
+                with self.server.condition:
+                    self.server.condition.wait()
+                self.send_frame()
+        except Exception as e:
+            if e.args[0] != 32:
+                print(e)
+
+    def get_thing(self, thing):
+        if isinstance(thing, dict):
+            content = dumps(thing).encode('utf-8')
+            ext = '.json'
+        else:
+            try:
+                with open('%s/%s' % (self.static_path, thing), 'rb') as f:
+                    content = f.read()
+            except OSError:
+                return None
+            ext = '.' + thing.rsplit('.', 1)[1].lower()
+
+        ctype = types_map.get(ext, 'application/octet-stream')
+        self.send_response(200)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', len(content))
+        self.end_headers()
+        return content
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        path = url.path[1:]
+        content = None
+
+        if path == 'status':
+            content = self.get_thing(self.server.status)
+        elif path == 'shutdown':
+            self.server.shutdown()
+        elif path == 'stream.mjpg':
+            self.send_stream()
+        else:
+            if path == '':
+                path = 'index.html'
+            content = self.get_thing(path)
+
+        if content is None:
+            self.send_response(404)
+            self.end_headers()
+        else:
+            self.wfile.write(content)
+
+    def do_POST(self):
+        clen = int(self.headers.get('Content-Length', 0))
+        if clen:
+            data = self.rfile.read(clen).decode('utf-8')
+            try:
+                self.server.status = loads(data)
+            except Exception as e:
+                print(e)
+        self.wfile.write(self.get_thing(self.server.status))
 
 
 if __name__ == '__main__':
