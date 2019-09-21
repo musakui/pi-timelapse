@@ -5,9 +5,23 @@ from mimetypes import types_map
 from urllib.parse import urlparse
 from threading import Thread, Condition
 from datetime import datetime, timedelta
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler
 
-from picamera import PiCamera
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    from http.server import HTTPServer
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+try:
+    from picamera import PiCamera
+except ImportError:
+    PiCamera = None
+    import sys
+    print('picamera not found', file=sys.stderr)
 
 CAM_ATTRS = {
     'iso': int,
@@ -26,11 +40,12 @@ CAM_ATTRS = {
 
 class PiCamServer(ThreadingHTTPServer):
 
-    stream_port = 2
+    stream_port = 1
     stream_size = (300, 225)
+    lapse_output = 'images/{timestamp:%y%m%d-%H%M%S}.jpg'
 
-    def __init__(self, address, handler):
-        super().__init__(address, handler)
+    def __init__(self, address):
+        super().__init__(address, PiCamHandler)
 
         self.count = 0
         self.frame = b''
@@ -53,6 +68,8 @@ class PiCamServer(ThreadingHTTPServer):
         if isinstance(val, PiCamera):
             self._camera = val
             return
+        elif self._camera is None:
+            return
         for k, v in val.items():
             ktype = CAM_ATTRS.get(k, str)
             if k == 'awb_mode' and v == 'fix':
@@ -65,14 +82,18 @@ class PiCamServer(ThreadingHTTPServer):
 
     @property
     def stream(self):
+        if self._camera is None:
+            return False
         return self._camera.recording
 
     @stream.setter
     def stream(self, v):
-        if v and not self._camera.recording:
+        if (self._camera is None) or v == self._camera.recording:
+            return
+        if v:
             stream_args = ('mjpeg', self.stream_size, self.stream_port)
             self._camera.start_recording(self, *stream_args)
-        elif not v and self._camera.recording:
+        else:
             self._camera.stop_recording(self.stream_port)
 
     @property
@@ -81,9 +102,8 @@ class PiCamServer(ThreadingHTTPServer):
 
     @lapse.setter
     def lapse(self, v):
-        if v == self._lapse_r:
+        if (self._camera is None) or v == self._lapse_r:
             return
-
         self._lapse_r = v
         if v:
             self._lapse_t = Thread(target=self._run_lapse)
@@ -138,9 +158,14 @@ class PiCamServer(ThreadingHTTPServer):
             target += self._lapse_d
 
             now = datetime.now()
+            filename = self.lapse_output.format(timestamp=now)
+            with open(filename, 'wb') as f:
+                f.write(output.getvalue())
             sleep((target - now).total_seconds())
 
     def fix_awb(self):
+        if self._camera is None:
+            return
         g = self._camera.awb_gains
         self._camera.awb_mode = 'off'
         self._camera.awb_gains = g
@@ -242,9 +267,7 @@ class PiCamHandler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     PORT = 9000
-    with PiCamera() as cam, PiCamServer(('', PORT), PiCamHandler) as server:
-        cam.resolution = (3280, 2464)
-        server.camera = cam
+    with PiCamServer(('', PORT)) as server:
         try:
             server.serve_forever()
         except KeyboardInterrupt:
